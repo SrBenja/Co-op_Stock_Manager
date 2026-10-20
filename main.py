@@ -1,5 +1,6 @@
 import urllib.request
 import urllib.error
+import re
 import webbrowser
 import tkinter.simpledialog as simpledialog
 import subprocess
@@ -13,10 +14,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd  #type: ignore
 from datetime import datetime
-from reportlab.lib.pagesizes import A4  #type: ignore
+from reportlab.lib.pagesizes import A4, landscape  #type: ignore
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph  #type: ignore
 from reportlab.lib import colors  #type: ignore
 from reportlab.lib.styles import getSampleStyleSheet  #type: ignore
+from xml.sax.saxutils import escape
 
 # --- CONSTANTES GLOBALES ---
 DB_NAME      = "stock_co-op.db"
@@ -25,7 +27,7 @@ BACKUP_DIR   = "backup"
 CONFIG_DIR   = "config"
 MAX_UNDO     = 30
 
-VERSION = "v0.1.0"   # incrementar esto cada vez que publique una nueva versión
+VERSION = "v0.1.1"   # incrementar esto cada vez que publique una nueva versión
 
 def _norm_tag(s):
     """
@@ -38,6 +40,28 @@ def _norm_tag(s):
     if s is None:
         return ""
     return str(s).strip().lstrip("vV").strip()
+
+
+def _compare_versions(installed, available):
+    """Compara versiones numéricas publicadas en GitHub.
+
+    Devuelve -1 si `available` es más reciente, 0 si son equivalentes y
+    1 si `installed` es más reciente. Devuelve None si una etiqueta no
+    tiene un formato numérico conocido: nunca sugiere una instalación
+    cuando no puede determinar que sea realmente una actualización.
+    """
+    def parts(tag):
+        normalized = _norm_tag(tag)
+        if not re.fullmatch(r"\d+(?:\.\d+){1,3}", normalized):
+            return None
+        numbers = tuple(int(part) for part in normalized.split("."))
+        return numbers + (0,) * (4 - len(numbers))
+
+    local = parts(installed)
+    remote = parts(available)
+    if local is None or remote is None:
+        return None
+    return (local > remote) - (local < remote)
 
 
 def _ask_update_custom(parent, title, message, width=760):
@@ -235,8 +259,23 @@ def check_updates():
         messagebox.showinfo("Actualizaciones", "No se pudo leer la etiqueta de la última release.")
         return
 
-    if _norm_tag(latest_tag) == _norm_tag(VERSION):
+    comparison = _compare_versions(VERSION, latest_tag)
+    if comparison == 0:
         messagebox.showinfo("Actualizaciones", f"Estás en la última versión: {VERSION}")
+        return
+    if comparison == 1:
+        messagebox.showinfo(
+            "Actualizaciones",
+            f"Tu versión instalada ({VERSION}) es más reciente que la última "
+            f"publicada en GitHub ({latest_tag}). No hay actualizaciones disponibles."
+        )
+        return
+    if comparison is None:
+        messagebox.showinfo(
+            "Actualizaciones",
+            f"No se pueden comparar las versiones {VERSION} y {latest_tag}. "
+            "No se ofrecerá ninguna instalación automática."
+        )
         return
 
     summary = (body[:800] + "...") if len(body) > 800 else body
@@ -341,6 +380,7 @@ VISIBLE_COLUMNS = [c for c in COLUMNS if c not in ("id", "categoria", "orden")]
 IMPORT_COLUMNS  = [c for c in COLUMNS if c not in ("id", "categoria", "orden")]
 
 COLUMN_LABELS = {
+    "categoria":         "Categoría",
     "cantidad":           "Cantidad",
     "codigo":             "Cod. Art.",
     "descripcion":        "Concepto",
@@ -351,7 +391,7 @@ COLUMN_LABELS = {
     "importe":            "Importe",
     "fecha_retiro":       "Fecha de retiro"
 }
-# 4. FUNCIONES DE NEGOCIO (CRUD, snapshots, backup, import/export, imprimir)
+# 4. FUNCIONES DE NEGOCIO (CRUD, snapshots, backup, import/export)
 undo_stack, redo_stack = [], []
 current_id = None
 
@@ -915,65 +955,76 @@ def exportar_csv():
         messagebox.showerror("Error al exportar CSV", str(e))
 
 
-def imprimir_stock():
-    # Pedir ruta de guardado
+def exportar_pdf():
+    # Usamos la categoría que está seleccionada en el selector de la pantalla principal.
+    categoria_actual = CATEGORIES[current_cat_idx]
+
+    # Pedir ruta de guardado (con un nombre distinto para cada categoría).
     path = filedialog.asksaveasfilename(
         defaultextension=".pdf",
         filetypes=[("PDF", "*.pdf")],
-        title="Guardar informe como"
+        initialfile=f"Stock_{categoria_actual}.pdf",
+        title=f"Exportar {categoria_actual} a PDF"
     )
     if not path:
         return
 
-    # Preparamos documento y estilos
-    doc = SimpleDocTemplate(
-        path,
-        pagesize=A4,
-        leftMargin=40, rightMargin=40,
-        topMargin=40, bottomMargin=40
-    )
-    styles = getSampleStyleSheet()
-    styleN = styles["BodyText"]
-    styleN.wordWrap = 'CJK'  # activa el wrap
+    try:
+        # Utilizamos A4 apaisado para dar espacio a las diez columnas del informe.
+        doc = SimpleDocTemplate(
+            path,
+            pagesize=landscape(A4),
+            leftMargin=30, rightMargin=30,
+            topMargin=40, bottomMargin=40
+        )
+        styles = getSampleStyleSheet()
+        styleN = styles["BodyText"]
+        styleN.wordWrap = "CJK"
+        styleN.fontSize = 8
+        styleN.leading = 10
 
-    # Encabezados y recogida de datos
-    data = []
-    cols_to_print = [c for c in COLUMNS if c != "id"]
-    header_pars = [Paragraph(COLUMN_LABELS[c], styleN) for c in cols_to_print]
-    data.append(header_pars)
+        # Omitimos los campos internos id y orden: este último conserva su función en la base de datos.
+        cols_to_print = [c for c in COLUMNS if c not in ("id", "orden")]
+        data = [[Paragraph(escape(COLUMN_LABELS[c]), styleN) for c in cols_to_print]]
+        row_indices = [COLUMNS.index(c) for c in cols_to_print]
 
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(f"SELECT {', '.join(COLUMNS)} FROM {TABLE_NAME}")
-        for row in cursor:
-            vals = []
-            for idx, c in enumerate(COLUMNS):
-                if c == "id":
-                    continue
-                vals.append(Paragraph(str(row[idx]), styleN))
-            data.append(vals)
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute(
+                f"SELECT {', '.join(COLUMNS)} FROM {TABLE_NAME} "
+                "WHERE categoria = ? ORDER BY orden, id",
+                (categoria_actual,)
+            )
+            for row in cursor:
+                data.append([
+                    Paragraph(escape(str(row[idx])) if row[idx] is not None else "", styleN)
+                    for idx in row_indices
+                ])
 
-    # Anchos iguales
-    page_w, page_h = A4
-    usable_w = page_w - doc.leftMargin - doc.rightMargin
-    n_cols   = len(cols_to_print)
-    colWidths = [usable_w / n_cols] * n_cols
+        # Damos más espacio a la descripción sin eliminar ninguna columna.
+        usable_w = landscape(A4)[0] - doc.leftMargin - doc.rightMargin
+        weights = {
+            "categoria": 1.25, "cantidad": 0.95,
+            "codigo": 1.10, "descripcion": 3.60, "iva": 0.65,
+            "precio_lista": 1.20, "bnf": 0.75, "precio_final": 1.20,
+            "importe": 1.20, "fecha_retiro": 1.35
+        }
+        total_weight = sum(weights[c] for c in cols_to_print)
+        colWidths = [usable_w * weights[c] / total_weight for c in cols_to_print]
 
-    # Tabla con encabezado repetido
-    table = Table(data, colWidths=colWidths, repeatRows=1)
-    table.setStyle(TableStyle([
-        ('GRID',       (0,0), (-1,-1), 0.5, colors.grey),
-        ('BACKGROUND', (0,0), (-1,0),   colors.lightblue),
-        ('VALIGN',     (0,0), (-1,-1),  'TOP'),
-        ('WORDWRAP',   (0,0), (-1,-1),  True),
-    ]))
+        table = Table(data, colWidths=colWidths, repeatRows=1)
+        table.setStyle(TableStyle([
+            ('GRID',       (0, 0), (-1, -1), 0.5, colors.grey),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
+            ('VALIGN',     (0, 0), (-1, -1), 'TOP'),
+            ('WORDWRAP',   (0, 0), (-1, -1), True),
+        ]))
+        doc.build([table])
+    except Exception as e:
+        messagebox.showerror("Error al generar PDF", str(e))
+        return
 
-    # Generamos el PDF y lo abrimos
-    doc.build([table])
-    messagebox.showinfo("Imprimir", f"PDF generado en:\n{path}")
-    if os.name == "nt":
-        os.startfile(path)
-    else:
-        os.system(f'xdg-open "{path}"')
+    # El PDF se guarda sin abrirse automáticamente: el usuario decide cuándo visualizarlo.
+    messagebox.showinfo("Exportar a PDF", f"Categoría exportada: {categoria_actual}\nPDF guardado en:\n{path}")
 
 def calcular_importe(event=None):
     # Leemos y limpiamos el contenido de P. lista
@@ -1251,12 +1302,13 @@ pages = [
      "- Barra de estado: total de productos y valor total del stock."
     ),
 
-    ("Importar y exportar CSV: Lo esencial",
+    ("Importar CSV y exportar CSV/PDF",
      "- Exporta todas las filas con las columnas: categoría, orden y las columnas visibles.\n"
      "- Los campos de precio e IVA se formatean con símbolos (por ejemplo: \"100.0 $\", \"21 %\").\n"
      "- Al importar se aceptan formatos con o sin símbolos y se normalizan (coma/punto).\n"
      "- Si faltan columnas obligatorias, la importación se aborta y se muestra un error.\n"
-     "- Consejo: exporta desde la aplicación para obtener un CSV reimportable de forma fiable."
+     "- Consejo: exporta desde la aplicación para obtener un CSV reimportable de forma fiable.\n"
+     "- Exportar a PDF guarda únicamente los artículos de la categoría seleccionada; a diferencia del CSV, no reúne todas las categorías."
     ),
 
     ("Backup y restauración — resumen",
@@ -1572,7 +1624,7 @@ def show_help_window():
 file_items = [
     ("Importar CSV",    importar_csv,      False),
     ("Exportar CSV",    exportar_csv,      False),
-    ("Imprimir",        imprimir_stock,    False),
+    ("Exportar a PDF",  exportar_pdf,       False),
 ]
 opt_items = [
     ("Modo Oscuro/Claro", toggle_theme,     False),
@@ -1617,8 +1669,23 @@ def download_and_install_release_exe(repo, preferred_asset_name=None):
     if not latest_tag:
         messagebox.showinfo("Actualizaciones", "No se encontró etiqueta en la última release.")
         return
-    if _norm_tag(latest_tag) == _norm_tag(VERSION):
+    comparison = _compare_versions(VERSION, latest_tag)
+    if comparison == 0:
         messagebox.showinfo("Actualizaciones", f"Estás en la última versión: {VERSION}")
+        return
+    if comparison == 1:
+        messagebox.showinfo(
+            "Actualizaciones",
+            f"Tu versión instalada ({VERSION}) es más reciente que la última "
+            f"publicada en GitHub ({latest_tag}). No se descargará una versión anterior."
+        )
+        return
+    if comparison is None:
+        messagebox.showinfo(
+            "Actualizaciones",
+            f"No se pueden comparar las versiones {VERSION} y {latest_tag}. "
+            "No se realizará ninguna descarga."
+        )
         return
 
     # Seleccionar asset .exe
@@ -2257,7 +2324,7 @@ entry_search.bind("<KeyRelease>", on_search_key)
 
 
 # — Variables de categoría —
-CATEGORIES = ["Plomería", "Gas", "Electricidad"]
+CATEGORIES = ["Plomería", "Gas", "Electricidad", "Herramientas"]
 current_cat_idx = 0
 
 # — Portapapeles interno para Copy/Paste de productos —
@@ -2623,8 +2690,8 @@ def check_updates_on_startup(delay_ms=1500):
     """
     Comprobación silenciosa que se ejecuta 1 vez al iniciar (llamar con root.after).
     - No muestra mensajes si no hay actualizaciones o si ocurre un error.
-    - Si encuentra una release con tag distinto a VERSION, muestra el diálogo modal personalizado
-      (Sí / No / Cancelar) para que el usuario elija qué hacer.
+    - Solo si encuentra una release con versión numérica superior a VERSION,
+      muestra el diálogo modal personalizado (Sí / No / Cancelar).
     """
     try:
         cfg = load_config()
@@ -2640,8 +2707,8 @@ def check_updates_on_startup(delay_ms=1500):
         if not latest_tag:
             return
 
-        if _norm_tag(latest_tag) == _norm_tag(VERSION):
-            return  # estás en la misma versión -> silencio
+        if _compare_versions(VERSION, latest_tag) != -1:
+            return  # misma versión, anterior o etiqueta desconocida -> silencio
 
         # hay una versión distinta: preparamos el mensaje resumido
         body = j.get("body", "") or ""
